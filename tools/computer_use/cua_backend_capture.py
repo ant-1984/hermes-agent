@@ -382,12 +382,38 @@ class _CaptureMixin:
         return [{"name": m.group(1).strip(), "pid": int(m.group(2))}
                 for m in map(re.compile(r'(.+?)\s+\(pid\s+(\d+)\)').search, data.splitlines()) if m] if isinstance(data, str) else []
 
+    def _exact_recovery_windows(self, windows: List[Dict[str, Any]], app: str) -> List[Dict[str, Any]]:
+        requested = app.strip().casefold()
+        if not requested:
+            return []
+        pids = set()
+        for entry in self.list_apps():
+            if entry.get("running") is False:
+                continue
+            aliases = {value.strip().casefold() for key in ("bundle_id", "bundleId", "name", "app_name", "display_name")
+                       if isinstance((value := entry.get(key)), str)}
+            if requested in aliases and (pid := _positive_int(entry.get("pid"))) is not None:
+                pids.add(pid)
+        # Respect hosts that scope list_apps to explicitly admitted processes.
+        # A window title/name alone must not reintroduce an excluded process.
+        return [w for w in windows if w["pid"] in pids]
+
     def focus_app(self, app: str, raise_window: bool = False) -> ActionResult:
         """Pure window-selector (store pid/window_id so later input hits the right process) — background
         automation never needs to raise a window. ``raise_window=True`` is explicit, separately approved,
         and uses the standalone ``bring_to_front`` tool."""
         with self._disarming():
             matched = self._match_windows_for_app(self.list_windows(), app)
+            recovering = not matched and raise_window
+            if recovering:
+                # Recovery is an explicit foreground request. Do not expose hidden
+                # windows to ordinary background capture or choose a sibling by z-order.
+                out = self._call_capture_tool("list_windows", {"on_screen_only": False, "session": self._session_id})
+                matched = self._exact_recovery_windows(_sorted_windows(out), app)
+                if len(matched) > 1:
+                    self._clear_active_target()
+                    return ActionResult(ok=False, action="focus_app", code="ambiguous_recovery_target",
+                                        message="Multiple off-screen windows match this app; restore the intended window explicitly.")
         # No silent fallback to the frontmost window: that hides the real failure (often a localized macOS
         # app-name mismatch).
         if not matched:
@@ -399,8 +425,22 @@ class _CaptureMixin:
             return ActionResult(ok=True, action="focus_app", message=f"Targeted {target['app_name']} (pid "
                                 f"{self._active_pid}, window {self._active_window_id}) without raising window.")
         if not self._session._has_tool("bring_to_front"):
+            if recovering:
+                self._clear_active_target()
             return ActionResult(ok=False, action="focus_app", code="bring_to_front_unsupported", message=_BTF_UNSUPPORTED_MSG)
         focused = self.bring_to_front(pid=self._active_pid, window_id=self._active_window_id)
+        if recovering:
+            if focused.ok:
+                with self._disarming():
+                    restored = [w for w in self.list_windows()
+                                if w["pid"] == target["pid"] and w["window_id"] == target["window_id"]]
+                if not restored:
+                    self._clear_active_target()
+                    return ActionResult(ok=False, action="focus_app", code="window_recovery_unverified",
+                                        message="The requested window is still not visible after recovery; no input target is armed.")
+                self._set_active_target(restored[0])
+            else:
+                self._clear_active_target()
         if focused.ok:
             focused.action = "focus_app"
             focused.meta["target_selected"] = True
